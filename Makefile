@@ -8,14 +8,9 @@ CONFIG_LOCAL_MAKE ?= config.local.mk
 
   $(call log.info, LOGGING_LEVEL)
 
-#: Show help message
-help::
-	@echo "Makefile for mediasources processing"
-	@echo "Usage: make <target>"
-	@echo "Targets:"
+include cookbook/help.mk
 
 .DEFAULT_GOAL := help
-.PHONY: help
 
 include cookbook/make_settings.mk
 
