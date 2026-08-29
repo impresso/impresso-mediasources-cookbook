@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "impresso_cookbook"
+version = "1.4.0"
+dependencies = [
+    "python-dotenv",
+    "smart-open[s3]",
+    "boto3 ==1.35.95",
+    "jq"
+]
+
+[project.scripts]
+s3_to_local_stamps = "impresso_cookbook.s3_to_local_stamps:main"
+
+[tool.setuptools]
+packages = ["impresso_cookbook"]
+package-dir = {"impresso_cookbook"= "."}
+
+[tool.mypy]
+mypy_path = ["."]
+packages = ["impresso_cookbook"]
