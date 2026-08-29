@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import bz2
 import json
 import logging
 import sys
 import time
+from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
 
 from smart_open import open as smart_open  # type: ignore
+
+COOKBOOK_LIB = Path(__file__).resolve().parents[1] / "cookbook" / "lib"
+if COOKBOOK_LIB.exists():
+    sys.path.insert(0, str(COOKBOOK_LIB))
 
 try:
     from impresso_cookbook import get_timestamp, get_transport_params, setup_logging  # type: ignore
@@ -49,12 +53,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
 
 
 def open_text(path: str, mode: str):
-    transport_params = get_transport_params(path)
-    if path.endswith(".bz2"):
-        binary_mode = mode.replace("t", "").replace("b", "") + "b"
-        raw = smart_open(path, binary_mode, transport_params=transport_params)
-        return bz2.open(raw, mode, encoding="utf-8")
-    return smart_open(path, mode, encoding="utf-8", transport_params=transport_params)
+    return smart_open(path, mode, encoding="utf-8", transport_params=get_transport_params(path))
 
 
 def batched(items: Iterable[dict[str, Any]], batch_size: int) -> Iterable[list[dict[str, Any]]]:
@@ -129,7 +128,8 @@ class MediaSourcesProcessor:
             min_score=min_score,
             local_files_only=local_files_only,
         )
-        commit_hash = getattr(self.pipeline.model.config, "_commit_hash", "unknown")
+        model_config = getattr(getattr(self.pipeline, "model", None), "config", None)
+        commit_hash = getattr(model_config, "_commit_hash", "unknown")
         log.info("Model commit hash: %s", commit_hash)
 
     def run(self) -> None:

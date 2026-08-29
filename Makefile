@@ -19,6 +19,11 @@ help::
 
 include cookbook/make_settings.mk
 
+NPROC_RAW := $(value NPROC)
+override NPROC := $(or $(strip $(NPROC_RAW)),1)
+COLLECTION_JOBS_RAW := $(value COLLECTION_JOBS)
+override COLLECTION_JOBS := $(or $(strip $(COLLECTION_JOBS_RAW)),1)
+
 include cookbook/setup.mk
 include cookbook/setup_python.mk
 include cookbook/setup_mediasources.mk
@@ -40,4 +45,3 @@ include cookbook/processing.mk
 include cookbook/processing_mediasources.mk
 
 include cookbook/local_to_s3.mk
-
