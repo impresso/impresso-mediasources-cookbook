@@ -1,5 +1,5 @@
 # Set the values accordingly
 # store as `.env` file
-CFG=config/config_v2-0-0.mk
+CFG=configs/config_mediasources-ner-mmbert-impresso-mediasources-ner_v2-0-0_v1-0-0.mk
 SE_ACCESS_KEY=<YOUR VALUE>
 SE_SECRET_KEY=<YOUR VALUE>
