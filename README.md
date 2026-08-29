@@ -32,13 +32,13 @@ from the `mediasourcespipeline` branch of
 Process locally available rebuilt files for one newspaper:
 
 ```bash
-make CONFIG_LOCAL_MAKE=config/config_v2-0-0.mk processing-target NEWSPAPER=GDL
+make CFG=config/config_v2-0-0.mk processing-target NEWSPAPER=GDL
 ```
 
 Full sync/process/upload workflow:
 
 ```bash
-make CONFIG_LOCAL_MAKE=config/config_v2-0-0.mk newspaper NEWSPAPER=GDL
+make CFG=config/config_v2-0-0.mk newspaper NEWSPAPER=GDL
 ```
 
 ## CLI

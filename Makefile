@@ -3,8 +3,11 @@
 
 include cookbook/log.mk
 
-CONFIG_LOCAL_MAKE ?= config.local.mk
--include $(CONFIG_LOCAL_MAKE)
+-include .env
+
+CFG ?= $(or $(strip $(CONFIG_LOCAL_MAKE)),config.local.mk)
+CONFIG_LOCAL_MAKE := $(CFG)
+-include $(CFG)
 
   $(call log.info, LOGGING_LEVEL)
 
