@@ -23,6 +23,10 @@ v2.0.0
 The reusable pipeline owns annotation tokenization, 512-subtoken model windows,
 window batching, BIO decoding, entity scoring, and `wkdata_qid` enrichment.
 
+During development, `impresso-pipelines[mediasources]` is installed directly
+from the `mediasourcespipeline` branch of
+`https://github.com/impresso/impresso-pipelines`.
+
 ## Usage
 
 Process locally available rebuilt files for one newspaper:
@@ -83,4 +87,3 @@ is passed.
   ]
 }
 ```
-

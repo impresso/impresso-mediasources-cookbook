@@ -12,7 +12,7 @@ check-jsonschema = "*"
 impresso-cookbook = {editable = true, path = "./cookbook/lib",version=">=1.0.4"}
 pipenv = "*"
 python-dotenv = "*"
-impresso-pipelines = {extras = ["mediasources"], version = "*"}
+impresso-pipelines = {extras = ["mediasources"], git = "https://github.com/impresso/impresso-pipelines.git", ref = "mediasourcespipeline"}
 transformers = "*"
 torch = "*"
 
@@ -21,4 +21,3 @@ ipykernel = "*"
 
 [requires]
 python_version = "3.11"
-
