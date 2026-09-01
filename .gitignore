@@ -30,3 +30,4 @@ lib/*_myprocessing.py
 Makefile.myprocessing
 .DS_Store
 Pipfile.lock
+impresso-pipelines

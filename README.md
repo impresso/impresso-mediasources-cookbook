@@ -27,6 +27,53 @@ During development, `impresso-pipelines[mediasources]` is installed directly
 from the `mediasourcespipeline` branch of
 `https://github.com/impresso/impresso-pipelines`.
 
+## Installation
+
+Create the local environment with Pipenv:
+
+```bash
+pipenv install --dev
+```
+
+This installs the corpus-processing dependencies plus the development notebook
+tools, including `ipykernel` and `ipython`.
+
+If you prefer a plain virtual environment, install the runtime requirements and
+then add the notebook tools:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pip install ipykernel ipython
+```
+
+For local development against a sibling checkout of `impresso-pipelines`, install
+that checkout in editable mode with the media-source extra:
+
+```bash
+pip install -e ../impresso-pipelines[mediasources]
+```
+
+## Manual Diagnostics Notebook
+
+The manual token-diagnostics notebook is available at:
+
+```text
+notebooks/manual_token_diagnostics.ipynb
+```
+
+Start Jupyter from the cookbook environment:
+
+```bash
+pipenv run jupyter notebook
+```
+
+Open the notebook, paste one rebuilt content-item JSON object into
+`CONTENT_ITEM_JSON`, and run the cells. The notebook reads the full text from
+`ft`, runs `MediaSourcesPipeline` with `diagnostics=True`, and displays entity,
+summary, highlighted-text, token-diagnostics, and raw JSON views.
+
 ## Usage
 
 Process locally available rebuilt files for one newspaper:
