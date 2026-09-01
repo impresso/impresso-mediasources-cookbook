@@ -42,6 +42,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32, help="Model window batch size")
     parser.add_argument("--outer-batch-size", type=int, default=4096, help="Documents buffered before bucketing")
     parser.add_argument("--min-score", type=float, default=None, help="Optional post-decoding entity score threshold")
+    parser.add_argument(
+        "--filter-anachronistic",
+        action="store_true",
+        help="Drop media-source entities whose configured start year is after the publication year",
+    )
     parser.add_argument("--local-files-only", action="store_true", help="Use only cached Hugging Face model files")
     parser.add_argument("--diagnostics", action="store_true", help="Include token-level diagnostics in output rows")
     parser.add_argument(
@@ -67,6 +72,24 @@ def batched(items: Iterable[dict[str, Any]], batch_size: int) -> Iterable[list[d
         yield batch
 
 
+def entity_to_nel(entity: dict[str, Any]) -> dict[str, Any]:
+    fine_grained_type = str(entity["label"])
+    coarse_type = fine_grained_type.split(".", 1)[0] if "." in fine_grained_type else fine_grained_type
+    return {
+        "type": coarse_type,
+        "fine_grained_type": fine_grained_type,
+        "surface": entity["surface"],
+        "lOffset": entity["start"],
+        "rOffset": entity["stop"],
+        "confidence_ner": entity["score"],
+        "confidence_nel": entity["score"],
+        "wkdata_qid": entity.get("wkdata_qid"),
+        "wkpedia_lg": None,
+        "wkpedia_pagename": None,
+        "start_year": entity.get("start_year"),
+    }
+
+
 def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
     with open_text(path, "rt") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -80,9 +103,11 @@ def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
             if not isinstance(row, dict):
                 raise ValueError(f"{path}:{line_number}: expected JSON object")
             text = row.get("ft", "")
-            content_id = row.get("id", row.get("c_id", ""))
+            content_id = row.get("ci_id", row.get("id", row.get("c_id", "")))
+            publication_date = row.get("date", row.get("d", row.get("year", row.get("publication_date"))))
             yield {
-                "id": content_id,
+                "ci_id": content_id,
+                "publication_date": publication_date,
                 "text": text if isinstance(text, str) else "",
                 "length": len(text) if isinstance(text, str) else 0,
             }
@@ -99,6 +124,7 @@ class MediaSourcesProcessor:
         batch_size: int,
         outer_batch_size: int,
         min_score: float | None,
+        filter_anachronistic: bool,
         local_files_only: bool,
         diagnostics: bool,
         write_empty: bool,
@@ -115,6 +141,7 @@ class MediaSourcesProcessor:
         self.batch_size = batch_size
         self.outer_batch_size = outer_batch_size
         self.min_score = min_score
+        self.filter_anachronistic = filter_anachronistic
         self.diagnostics = diagnostics
         self.write_empty = write_empty
         self.timestamp = get_timestamp()
@@ -131,6 +158,7 @@ class MediaSourcesProcessor:
         model_config = getattr(getattr(self.pipeline, "model", None), "config", None)
         commit_hash = getattr(model_config, "_commit_hash", "unknown")
         log.info("Model commit hash: %s", commit_hash)
+        self.model_id = f"{hf_model}@{revision}"
 
     def run(self) -> None:
         started = time.time()
@@ -155,9 +183,15 @@ class MediaSourcesProcessor:
                 # stable item IDs, so corpus-level output identity is unaffected.
                 sorted_items = sorted(non_empty, key=lambda item: item["length"])
                 texts = [item["text"] for item in sorted_items]
+                publication_dates = [item["publication_date"] for item in sorted_items]
 
                 batch_started = time.time()
-                results = self.pipeline(texts, diagnostics=self.diagnostics)
+                results = self.pipeline(
+                    texts,
+                    publication_date=publication_dates,
+                    filter_anachronistic=self.filter_anachronistic,
+                    diagnostics=self.diagnostics,
+                )
                 if not isinstance(results, list):
                     results = [results]
                 duration = max(time.time() - batch_started, 1e-9)
@@ -180,10 +214,10 @@ class MediaSourcesProcessor:
                             entity_counts.get(entity.get("label", "unknown"), 0) + 1
                         )
                     output_row = {
-                        "id": item["id"],
+                        "ci_id": item["ci_id"],
                         "ts": self.timestamp,
-                        "media_sources": entities,
-                        "summary": result.get("summary", []),
+                        "model_id": self.model_id,
+                        "nes": [entity_to_nel(entity) for entity in entities],
                     }
                     if self.diagnostics:
                         output_row["diagnostics"] = {
@@ -206,6 +240,7 @@ class MediaSourcesProcessor:
         log.info("Processed non-empty docs: %s", processed_count)
         log.info("Skipped empty docs: %s", skipped_empty_count)
         log.info("Written rows: %s", written_count)
+        log.info("Recognized media-source entities: %s", sum(entity_counts.values()))
         log.info("Throughput: %.1f docs/s", processed_count / total_duration)
         if entity_counts:
             log.info("Entity type summary:")
@@ -224,6 +259,7 @@ def main(args: list[str] | None = None) -> None:
         outer_batch_size=options.outer_batch_size,
         min_score=options.min_score,
         local_files_only=options.local_files_only,
+        filter_anachronistic=options.filter_anachronistic,
         diagnostics=options.diagnostics,
         write_empty=options.write_empty,
         log_level=options.log_level,
