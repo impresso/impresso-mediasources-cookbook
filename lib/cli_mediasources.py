@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import json
 import logging
 import sys
@@ -9,6 +11,8 @@ import time
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
+
+DEBUG_TOKEN_CONTEXT = 2
 
 from smart_open import open as smart_open  # type: ignore
 
@@ -40,6 +44,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-model", default="impresso-project/mmbert-impresso-mediasources-ner")
     parser.add_argument("--revision", default="v2.0.0")
     parser.add_argument("--batch-size", type=int, default=32, help="Model window batch size")
+    parser.add_argument("--device", default="-1", help="Torch device for model inference, e.g. -1, cpu, mps, cuda:0")
     parser.add_argument("--outer-batch-size", type=int, default=4096, help="Documents buffered before bucketing")
     parser.add_argument("--min-score", type=float, default=None, help="Optional post-decoding entity score threshold")
     parser.add_argument(
@@ -70,6 +75,49 @@ def batched(items: Iterable[dict[str, Any]], batch_size: int) -> Iterable[list[d
             batch = []
     if batch:
         yield batch
+
+
+def text_preview(text: str, *, max_chars: int = 80) -> str:
+    collapsed = " ".join(text.split())
+    return collapsed if len(collapsed) <= max_chars else collapsed[: max_chars - 1] + "..."
+
+
+def text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def text_context(text: str, start: int | None, stop: int | None, *, radius: int = 40) -> str:
+    if start is None or stop is None:
+        return ""
+    left = max(0, int(start) - radius)
+    right = min(len(text), int(stop) + radius)
+    return text[left:right].replace("\n", "\\n")
+
+
+def debug_non_o_tokens(result: dict[str, Any]) -> list[dict[str, Any]]:
+    tokens = result.get("tokens", [])
+    starts = result.get("token_start_offsets", [])
+    stops = result.get("token_end_offsets", [])
+    labels = result.get("token_labels", [])
+    scores = result.get("token_scores", [])
+    rows: list[dict[str, Any]] = []
+    for index, label in enumerate(labels):
+        if label == "O":
+            continue
+        left = max(0, index - DEBUG_TOKEN_CONTEXT)
+        right = min(len(tokens), index + DEBUG_TOKEN_CONTEXT + 1)
+        rows.append(
+            {
+                "i": index,
+                "token": tokens[index] if index < len(tokens) else "",
+                "start": starts[index] if index < len(starts) else None,
+                "stop": stops[index] if index < len(stops) else None,
+                "label": label,
+                "score": scores[index] if index < len(scores) else None,
+                "context": " ".join(str(token) for token in tokens[left:right]),
+            }
+        )
+    return rows
 
 
 def entity_to_nel(entity: dict[str, Any]) -> dict[str, Any]:
@@ -123,6 +171,7 @@ class MediaSourcesProcessor:
         revision: str,
         batch_size: int,
         outer_batch_size: int,
+        device: str | int | None,
         min_score: float | None,
         filter_anachronistic: bool,
         local_files_only: bool,
@@ -148,10 +197,28 @@ class MediaSourcesProcessor:
 
         setup_logging(log_level, log_file, logger=log)
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s", hf_model, revision)
+        if log.isEnabledFor(logging.DEBUG):
+            try:
+                import impresso_pipelines  # type: ignore
+                import torch  # type: ignore
+                import transformers  # type: ignore
+
+                log.debug(
+                    "Runtime imports: impresso_pipelines=%s path=%s MediaSourcesPipeline=%s "
+                    "transformers=%s torch=%s",
+                    getattr(impresso_pipelines, "__version__", "unknown"),
+                    getattr(impresso_pipelines, "__file__", "unknown"),
+                    inspect.getfile(MediaSourcesPipeline),
+                    getattr(transformers, "__version__", "unknown"),
+                    getattr(torch, "__version__", "unknown"),
+                )
+            except Exception as exc:
+                log.debug("Runtime import diagnostics unavailable: %s", exc)
         self.pipeline = MediaSourcesPipeline(
             model=hf_model,
             revision=revision,
             batch_size=batch_size,
+            device=device,
             min_score=min_score,
             local_files_only=local_files_only,
         )
@@ -159,6 +226,28 @@ class MediaSourcesProcessor:
         commit_hash = getattr(model_config, "_commit_hash", "unknown")
         log.info("Model commit hash: %s", commit_hash)
         self.model_id = f"{hf_model}@{revision}"
+        log.debug(
+            "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s min_score=%s "
+            "device=%s filter_anachronistic=%s diagnostics=%s write_empty=%s local_files_only=%s",
+            input_file,
+            output_file,
+            batch_size,
+            outer_batch_size,
+            min_score,
+            device,
+            filter_anachronistic,
+            diagnostics,
+            write_empty,
+            local_files_only,
+        )
+        log.debug(
+            "Pipeline protocol: decoder=%s max_sequence_len=%s max_annotation_tokens=%s stride=%s device=%s",
+            getattr(self.pipeline, "decoder", "unknown"),
+            getattr(self.pipeline, "max_sequence_len", "unknown"),
+            getattr(self.pipeline, "max_annotation_tokens", "unknown"),
+            getattr(self.pipeline, "stride", "unknown"),
+            getattr(self.pipeline, "device", "unknown"),
+        )
 
     def run(self) -> None:
         started = time.time()
@@ -174,14 +263,44 @@ class MediaSourcesProcessor:
                 start=1,
             ):
                 read_count += len(batch)
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        "Outer batch %s raw rows: %s",
+                        outer_batch_index,
+                        [
+                            {
+                                "ci_id": item["ci_id"],
+                                "publication_date": item["publication_date"],
+                                "length": item["length"],
+                                "sha256": text_sha256(item["text"]),
+                                "preview": text_preview(item["text"]),
+                            }
+                            for item in batch
+                        ],
+                    )
                 non_empty = [item for item in batch if item["text"].strip()]
                 skipped_empty_count += len(batch) - len(non_empty)
                 if not non_empty:
+                    log.debug("Outer batch %s contains no non-empty documents", outer_batch_index)
                     continue
 
                 # Reorder only inside the outer batch. Results are joined back by
                 # stable item IDs, so corpus-level output identity is unaffected.
                 sorted_items = sorted(non_empty, key=lambda item: item["length"])
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        "Outer batch %s sorted order: %s",
+                        outer_batch_index,
+                        [
+                            {
+                                "ci_id": item["ci_id"],
+                                "publication_date": item["publication_date"],
+                                "length": item["length"],
+                                "sha256": text_sha256(item["text"]),
+                            }
+                            for item in sorted_items
+                        ],
+                    )
                 texts = [item["text"] for item in sorted_items]
                 publication_dates = [item["publication_date"] for item in sorted_items]
 
@@ -207,6 +326,40 @@ class MediaSourcesProcessor:
 
                 for item, result in zip(sorted_items, results, strict=True):
                     entities = result.get("entities", [])
+                    if log.isEnabledFor(logging.DEBUG):
+                        text_hash = text_sha256(item["text"])
+                        log.debug(
+                            "Document result: ci_id=%s publication_date=%s length=%s sha256=%s "
+                            "entities=%s inference_diagnostics=%s",
+                            item["ci_id"],
+                            item["publication_date"],
+                            item["length"],
+                            text_hash,
+                            [
+                                {
+                                    "surface": entity.get("surface"),
+                                    "label": entity.get("label"),
+                                    "start": entity.get("start"),
+                                    "stop": entity.get("stop"),
+                                    "score": entity.get("score"),
+                                    "wkdata_qid": entity.get("wkdata_qid"),
+                                    "start_year": entity.get("start_year"),
+                                    "context": text_context(
+                                        item["text"],
+                                        entity.get("start"),
+                                        entity.get("stop"),
+                                    ),
+                                }
+                                for entity in entities
+                            ],
+                            result.get("inference_diagnostics"),
+                        )
+                        if self.diagnostics:
+                            log.debug(
+                                "Document non-O tokens: ci_id=%s tokens=%s",
+                                item["ci_id"],
+                                debug_non_o_tokens(result),
+                            )
                     if not entities and not self.write_empty:
                         continue
                     for entity in entities:
@@ -257,6 +410,7 @@ def main(args: list[str] | None = None) -> None:
         revision=options.revision,
         batch_size=options.batch_size,
         outer_batch_size=options.outer_batch_size,
+        device=int(options.device) if str(options.device).lstrip("-").isdigit() else options.device,
         min_score=options.min_score,
         local_files_only=options.local_files_only,
         filter_anachronistic=options.filter_anachronistic,

@@ -36,7 +36,14 @@ pipenv install --dev
 ```
 
 This installs the corpus-processing dependencies plus the development notebook
-tools, including `ipykernel` and `ipython`.
+tools, including `ipykernel` and `ipython`. The model stack is pinned to the
+training environment (`transformers==5.9.0`, `torch==2.12.0`,
+`numpy==2.4.6`). If an existing environment already has older or incompatible
+model packages, refresh the pinned model stack:
+
+```bash
+pipenv update transformers torch numpy
+```
 
 If you prefer a plain virtual environment, install the runtime requirements and
 then add the notebook tools:

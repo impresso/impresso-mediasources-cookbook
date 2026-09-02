@@ -3,10 +3,11 @@ boto3==1.35.95
 boto3-stubs==1.35.95
 check-jsonschema
 -e ./cookbook/lib
-impresso-pipelines[mediasources] @ git+https://github.com/impresso/impresso-pipelines.git@mediasourcespipeline
+-e ../impresso-pipelines[mediasources]
 pipenv
 python-dotenv
 requests
 smart-open[http,s3]==6.4.0
-torch
-transformers
+numpy==2.4.6
+torch==2.12.0
+transformers==5.9.0
