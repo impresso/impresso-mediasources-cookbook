@@ -32,8 +32,14 @@ from the `mediasourcespipeline` branch of
 Clone the cookbook repository and enter it:
 
 ```bash
-git clone https://github.com/impresso/impresso-mediasources-cookbook.git
+git clone --recursive https://github.com/impresso/impresso-mediasources-cookbook.git
 cd impresso-mediasources-cookbook
+```
+
+If you already cloned without submodules, initialize them before installing:
+
+```bash
+git submodule update --init --recursive
 ```
 
 Create the local environment with Pipenv:
@@ -59,6 +65,14 @@ checkout of `impresso-pipelines`, switch the commented/local dependency line in
 
 ```bash
 pip install -e ../impresso-pipelines[mediasources]
+```
+
+If installing with `requirements.txt`, keep the `impresso-pipelines` line as
+plain text. It intentionally uses the GitHub branch archive URL to avoid Git
+credential prompts on servers:
+
+```text
+impresso-pipelines[mediasources] @ https://github.com/impresso/impresso-pipelines/archive/refs/heads/mediasourcespipeline.zip
 ```
 
 If you prefer a plain virtual environment, install the runtime requirements and
