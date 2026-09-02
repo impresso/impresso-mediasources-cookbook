@@ -16,7 +16,7 @@ python-dotenv = "*"
 impresso-pipelines = {git = "https://github.com/impresso/impresso-pipelines.git", ref = "mediasourcespipeline", extras = ["mediasources"]}
 transformers = "==5.9.0"
 torch = "==2.12.0"
-numpy = "==2.4.6"
+numpy = ">=1.26,<2"
 
 [dev-packages]
 pytest = "*"

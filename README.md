@@ -49,10 +49,11 @@ pipenv install --dev
 ```
 
 This installs the corpus-processing dependencies plus the development notebook
-tools, including `ipykernel` and `ipython`. The model stack is pinned to the
-training environment (`transformers==5.9.0`, `torch==2.12.0`,
-`numpy==2.4.6`). If an existing environment already has older or incompatible
-model packages, refresh the pinned model stack:
+tools, including `ipykernel` and `ipython`. The model-critical stack is pinned
+to the training environment (`transformers==5.9.0`, `torch==2.12.0`). NumPy is
+kept compatible with the current `impresso-pipelines` package metadata
+(`numpy>=1.26,<2`). If an existing environment already has older or incompatible
+model packages, refresh the model stack:
 
 ```bash
 pipenv update transformers torch numpy
