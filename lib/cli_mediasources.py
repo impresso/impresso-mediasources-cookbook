@@ -44,7 +44,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-model", default="impresso-project/mmbert-impresso-mediasources-ner")
     parser.add_argument("--revision", default="v2.0.0")
     parser.add_argument("--batch-size", type=int, default=32, help="Model window batch size")
-    parser.add_argument("--device", default="-1", help="Torch device for model inference, e.g. -1, cpu, mps, cuda:0")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Torch device for model inference: auto, -1/cpu, mps, cuda:0, or CUDA device index",
+    )
     parser.add_argument("--outer-batch-size", type=int, default=4096, help="Documents buffered before bucketing")
     parser.add_argument("--min-score", type=float, default=None, help="Optional post-decoding entity score threshold")
     parser.add_argument(
@@ -403,6 +407,9 @@ class MediaSourcesProcessor:
 
 def main(args: list[str] | None = None) -> None:
     options = parse_args(args)
+    device = None if str(options.device).lower() == "auto" else options.device
+    if isinstance(device, str) and device.lstrip("-").isdigit():
+        device = int(device)
     processor = MediaSourcesProcessor(
         input_file=options.input,
         output_file=options.output,
@@ -410,7 +417,7 @@ def main(args: list[str] | None = None) -> None:
         revision=options.revision,
         batch_size=options.batch_size,
         outer_batch_size=options.outer_batch_size,
-        device=int(options.device) if str(options.device).lstrip("-").isdigit() else options.device,
+        device=device,
         min_score=options.min_score,
         local_files_only=options.local_files_only,
         filter_anachronistic=options.filter_anachronistic,
