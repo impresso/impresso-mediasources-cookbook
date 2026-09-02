@@ -29,6 +29,13 @@ from the `mediasourcespipeline` branch of
 
 ## Installation
 
+Clone the cookbook repository and enter it:
+
+```bash
+git clone https://github.com/impresso/impresso-mediasources-cookbook.git
+cd impresso-mediasources-cookbook
+```
+
 Create the local environment with Pipenv:
 
 ```bash
@@ -45,6 +52,15 @@ model packages, refresh the pinned model stack:
 pipenv update transformers torch numpy
 ```
 
+The default dependency configuration installs `impresso-pipelines` from the
+`mediasourcespipeline` branch on GitHub. For local development against a sibling
+checkout of `impresso-pipelines`, switch the commented/local dependency line in
+`Pipfile` or install that checkout in editable mode:
+
+```bash
+pip install -e ../impresso-pipelines[mediasources]
+```
+
 If you prefer a plain virtual environment, install the runtime requirements and
 then add the notebook tools:
 
@@ -53,13 +69,6 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 pip install ipykernel ipython
-```
-
-For local development against a sibling checkout of `impresso-pipelines`, install
-that checkout in editable mode with the media-source extra:
-
-```bash
-pip install -e ../impresso-pipelines[mediasources]
 ```
 
 ## Manual Diagnostics Notebook
@@ -106,7 +115,9 @@ python3 lib/cli_mediasources.py \
   --hf-model impresso-project/mmbert-impresso-mediasources-ner \
   --revision v2.0.0 \
   --batch-size 32 \
-  --outer-batch-size 4096
+  --outer-batch-size 512 \
+  --device auto \
+  --filter-anachronistic
 ```
 
 `--batch-size` controls model window batch size inside
