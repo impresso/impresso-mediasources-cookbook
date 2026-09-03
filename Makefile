@@ -42,4 +42,6 @@ include cookbook/clean.mk
 include cookbook/processing.mk
 include cookbook/processing_mediasources.mk
 
+include cookbook/aggregators_mediasources.mk
+
 include cookbook/local_to_s3.mk
