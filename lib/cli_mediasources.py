@@ -571,6 +571,12 @@ class MediaSourcesProcessor:
 
 def main(args: list[str] | None = None) -> None:
     options = parse_args(args)
+
+    # Configure logging before model initialization so CLI arguments are captured
+    # even if pipeline construction fails.
+    setup_logging(options.log_level, options.log_file, logger=log)
+    log.info("%s", options)
+
     device = None if str(options.device).lower() == "auto" else options.device
     if isinstance(device, str) and device.lstrip("-").isdigit():
         device = int(device)
