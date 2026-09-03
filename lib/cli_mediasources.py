@@ -693,6 +693,27 @@ class MediaSourcesProcessor:
         log.info("Processed non-empty docs: %s", processed_count)
         log.info("Skipped empty docs: %s", skipped_empty_count)
         log.info("Skipped sampled-out non-empty docs: %s", skipped_sampled_count)
+        sample_eligible_count = processed_count + skipped_sampled_count
+        if self.sample < 1.0:
+            kept_percent = 100.0 * processed_count / sample_eligible_count if sample_eligible_count else 0.0
+            excluded_percent = 100.0 * skipped_sampled_count / sample_eligible_count if sample_eligible_count else 0.0
+            log.info(
+                "Sampling summary: sample=%s seed=%s eligible_non_empty_docs=%s "
+                "processed_docs=%s sampled_out_docs=%s kept=%.1f%% excluded=%.1f%%",
+                self.sample,
+                self.sample_seed,
+                sample_eligible_count,
+                processed_count,
+                skipped_sampled_count,
+                kept_percent,
+                excluded_percent,
+            )
+        else:
+            log.info(
+                "Sampling summary: disabled sample=%s eligible_non_empty_docs=%s sampled_out_docs=0",
+                self.sample,
+                sample_eligible_count,
+            )
         log.info("Written rows: %s", written_count)
         log.info("Recognized media-source entities: %s", sum(entity_counts.values()))
         log.info("Inference configuration:")
