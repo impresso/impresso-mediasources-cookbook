@@ -13,6 +13,14 @@ from collections.abc import Iterable
 from typing import Any
 
 DEBUG_TOKEN_CONTEXT = 2
+REQUIRED_INFERENCE_STATS = {
+    "documents",
+    "tokens",
+    "windows",
+    "model_batches",
+    "inference_seconds",
+    "model_forward_seconds",
+}
 
 from smart_open import open as smart_open  # type: ignore
 
@@ -76,15 +84,27 @@ def open_text(path: str, mode: str):
     return smart_open(path, mode, encoding="utf-8", transport_params=get_transport_params(path))
 
 
-def batched(items: Iterable[dict[str, Any]], batch_size: int) -> Iterable[list[dict[str, Any]]]:
+def non_empty_batches(
+    items: Iterable[dict[str, Any]],
+    batch_size: int,
+) -> Iterable[tuple[list[dict[str, Any]], int, int]]:
     batch: list[dict[str, Any]] = []
+    read_count = 0
+    skipped_empty_since_batch = 0
     for item in items:
+        read_count += 1
+        if not item["text"].strip():
+            skipped_empty_since_batch += 1
+            continue
         batch.append(item)
         if len(batch) >= batch_size:
-            yield batch
+            yield batch, read_count, skipped_empty_since_batch
+            skipped_empty_since_batch = 0
             batch = []
     if batch:
-        yield batch
+        yield batch, read_count, skipped_empty_since_batch
+    elif skipped_empty_since_batch:
+        yield [], read_count, skipped_empty_since_batch
 
 
 def text_preview(text: str, *, max_chars: int = 80) -> str:
@@ -196,6 +216,17 @@ def fmt_seconds(value: float) -> str:
     return f"{value:.2f}s"
 
 
+def validate_inference_stats(stats: dict[str, Any], pipeline: Any) -> None:
+    missing_stats = REQUIRED_INFERENCE_STATS - stats.keys()
+    if missing_stats:
+        raise RuntimeError(
+            "MediaSourcesPipeline returned incomplete inference diagnostics; "
+            f"missing={sorted(missing_stats)} "
+            f"pipeline_class={type(pipeline).__module__}.{type(pipeline).__qualname__} "
+            f"pipeline_source={inspect.getfile(type(pipeline))}"
+        )
+
+
 def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
     with open_text(path, "rt") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -262,23 +293,23 @@ class MediaSourcesProcessor:
         setup_logging(log_level, log_file, logger=log)
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s dtype=%s", hf_model, revision, dtype)
         log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
-        if log.isEnabledFor(logging.DEBUG):
-            try:
-                import impresso_pipelines  # type: ignore
-                import torch  # type: ignore
-                import transformers  # type: ignore
+        try:
+            import impresso_pipelines  # type: ignore
+            import torch  # type: ignore
+            import transformers  # type: ignore
 
-                log.debug(
-                    "Runtime imports: impresso_pipelines=%s path=%s MediaSourcesPipeline=%s "
-                    "transformers=%s torch=%s",
-                    getattr(impresso_pipelines, "__version__", "unknown"),
-                    getattr(impresso_pipelines, "__file__", "unknown"),
-                    inspect.getfile(MediaSourcesPipeline),
-                    getattr(transformers, "__version__", "unknown"),
-                    getattr(torch, "__version__", "unknown"),
-                )
-            except Exception as exc:
-                log.debug("Runtime import diagnostics unavailable: %s", exc)
+            log.info(
+                "Runtime imports: impresso_pipelines=%s path=%s MediaSourcesPipeline=%s "
+                "transformers=%s torch=%s cuda=%s",
+                getattr(impresso_pipelines, "__version__", "unknown"),
+                getattr(impresso_pipelines, "__file__", "unknown"),
+                inspect.getfile(MediaSourcesPipeline),
+                getattr(transformers, "__version__", "unknown"),
+                getattr(torch, "__version__", "unknown"),
+                getattr(torch.version, "cuda", None),
+            )
+        except Exception as exc:
+            log.warning("Runtime import diagnostics unavailable: %s", exc)
         self.pipeline = MediaSourcesPipeline(
             model=hf_model,
             revision=revision,
@@ -333,14 +364,15 @@ class MediaSourcesProcessor:
         entity_counts: dict[str, int] = {}
 
         with open_text(self.output_file, "wt") as output_stream:
-            for outer_batch_index, batch in enumerate(
-                batched(iter_input_rows(self.input_file), self.outer_batch_size),
+            for outer_batch_index, (batch, latest_read_count, skipped_empty_since_batch) in enumerate(
+                non_empty_batches(iter_input_rows(self.input_file), self.outer_batch_size),
                 start=1,
             ):
-                read_count += len(batch)
+                read_count = latest_read_count
+                skipped_empty_count += skipped_empty_since_batch
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug(
-                        "Outer batch %s raw rows: %s",
+                        "Outer batch %s non-empty rows: %s",
                         outer_batch_index,
                         [
                             {
@@ -353,30 +385,27 @@ class MediaSourcesProcessor:
                             for item in batch
                         ],
                     )
-                non_empty = [item for item in batch if item["text"].strip()]
-                skipped_empty_count += len(batch) - len(non_empty)
-                if not non_empty:
+                if not batch:
                     log.info(
-                        "Outer batch %s: docs=0/%s skipped_empty_docs=%s doc_lengths=%s",
+                        "Outer batch %s: docs=0 read_rows=%s skipped_empty_docs_since_previous=%s",
                         outer_batch_index,
-                        len(batch),
-                        len(batch),
-                        length_summary([item["length"] for item in batch]),
+                        read_count,
+                        skipped_empty_since_batch,
                     )
                     continue
 
                 # Reorder only inside the outer batch. Results are joined back by
                 # stable item IDs, so corpus-level output identity is unaffected.
-                sorted_items = sorted(non_empty, key=lambda item: item["length"])
+                sorted_items = sorted(batch, key=lambda item: item["length"])
                 batch_chars = sum(item["length"] for item in sorted_items)
                 doc_lengths = [item["length"] for item in sorted_items]
                 log.info(
-                    "Outer batch %s: docs=%s/%s skipped_empty_docs=%s chars=%s "
+                    "Outer batch %s: docs=%s read_rows=%s skipped_empty_docs_since_previous=%s chars=%s "
                     "model_window_batch_size=%s outer_batch_size=%s doc_lengths=%s",
                     outer_batch_index,
                     len(sorted_items),
-                    len(batch),
-                    len(batch) - len(non_empty),
+                    read_count,
+                    skipped_empty_since_batch,
                     fmt_int(batch_chars),
                     self.batch_size,
                     self.outer_batch_size,
@@ -411,6 +440,7 @@ class MediaSourcesProcessor:
                     results = [results]
                 duration = max(time.perf_counter() - batch_started, 1e-9)
                 stats = getattr(self.pipeline, "last_inference_stats", {}) or {}
+                validate_inference_stats(stats, self.pipeline)
                 batch_tokens = int(stats.get("tokens") or 0)
                 batch_windows = int(stats.get("windows") or 0)
                 batch_model_batches = int(stats.get("model_batches") or 0)
