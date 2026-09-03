@@ -45,6 +45,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--revision", default="v2.0.0")
     parser.add_argument("--batch-size", type=int, default=32, help="Model window batch size")
     parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Model inference dtype (default: %(default)s)",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="Torch device for model inference: auto, -1/cpu, mps, cuda:0, or CUDA device index",
@@ -200,6 +206,7 @@ class MediaSourcesProcessor:
         output_file: str,
         hf_model: str,
         revision: str,
+        dtype: str,
         batch_size: int,
         outer_batch_size: int,
         device: str | int | None,
@@ -215,6 +222,8 @@ class MediaSourcesProcessor:
             raise ValueError("batch_size must be positive")
         if outer_batch_size <= 0:
             raise ValueError("outer_batch_size must be positive")
+        if dtype == "float16" and str(device).lower() in {"-1", "cpu"}:
+            raise ValueError("float16 dtype is not supported for CPU inference; use float32 or a CUDA device")
 
         self.input_file = input_file
         self.output_file = output_file
@@ -227,7 +236,7 @@ class MediaSourcesProcessor:
         self.timestamp = get_timestamp()
 
         setup_logging(log_level, log_file, logger=log)
-        log.info("Initializing MediaSourcesPipeline model=%s revision=%s", hf_model, revision)
+        log.info("Initializing MediaSourcesPipeline model=%s revision=%s dtype=%s", hf_model, revision, dtype)
         log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
         if log.isEnabledFor(logging.DEBUG):
             try:
@@ -249,6 +258,7 @@ class MediaSourcesProcessor:
         self.pipeline = MediaSourcesPipeline(
             model=hf_model,
             revision=revision,
+            dtype=dtype,
             batch_size=batch_size,
             device=device,
             min_score=min_score,
@@ -258,7 +268,7 @@ class MediaSourcesProcessor:
         commit_hash = getattr(model_config, "_commit_hash", "unknown")
         log.info("Model commit hash: %s", commit_hash)
         log.info("Model dtype: %s", model_dtype(getattr(self.pipeline, "model", None)))
-        self.model_id = f"{hf_model}@{revision}"
+        self.model_id = f"{hf_model}@{revision}#{dtype}"
         log.debug(
             "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s min_score=%s "
             "device=%s filter_anachronistic=%s diagnostics=%s write_empty=%s local_files_only=%s",
@@ -461,6 +471,7 @@ def main(args: list[str] | None = None) -> None:
         output_file=options.output,
         hf_model=options.hf_model,
         revision=options.revision,
+        dtype=options.dtype,
         batch_size=options.batch_size,
         outer_batch_size=options.outer_batch_size,
         device=device,
