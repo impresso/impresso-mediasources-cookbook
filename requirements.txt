@@ -4,6 +4,8 @@ boto3-stubs==1.35.95
 check-jsonschema
 -e ./cookbook/lib
 # -e ../impresso-pipelines[mediasources]
+# Keep this constraint in sync with the version in the GitHub archive metadata.
+impresso-pipelines==0.6.1.2
 impresso-pipelines[mediasources] @ https://github.com/impresso/impresso-pipelines/archive/refs/heads/mediasourcespipeline.zip
 pipenv
 python-dotenv

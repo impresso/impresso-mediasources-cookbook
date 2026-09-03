@@ -69,9 +69,11 @@ pip install -e ../impresso-pipelines[mediasources]
 
 If installing with `requirements.txt`, keep the `impresso-pipelines` line as
 plain text. It intentionally uses the GitHub branch archive URL to avoid Git
-credential prompts on servers:
+credential prompts on servers. The separate version constraint makes pip reject
+a stale branch archive whose package metadata has not advanced:
 
 ```text
+impresso-pipelines==0.6.1.2
 impresso-pipelines[mediasources] @ https://github.com/impresso/impresso-pipelines/archive/refs/heads/mediasourcespipeline.zip
 ```
 
