@@ -7,6 +7,8 @@ import inspect
 import json
 import logging
 import os
+import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -72,6 +74,27 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Torch device for model inference: auto, -1/cpu, mps, cuda:0, or CUDA device index",
     )
     parser.add_argument("--outer-batch-size", type=int, default=4096, help="Documents buffered before bucketing")
+    parser.add_argument(
+        "--min-year",
+        "--earliest-year-to-consider",
+        dest="min_year",
+        type=int,
+        default=None,
+        help="Skip processing and write an empty output when the input publication year is earlier than YEAR",
+        metavar="YEAR",
+    )
+    parser.add_argument(
+        "--sample",
+        type=float,
+        default=1.0,
+        help="Randomly keep this fraction of non-empty documents before inference (0 < sample <= 1; default: %(default)s)",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for --sample",
+    )
     parser.add_argument("--min-score", type=float, default=None, help="Optional post-decoding entity score threshold")
     parser.add_argument(
         "--filter-anachronistic",
@@ -95,24 +118,53 @@ def open_text(path: str, mode: str):
 def non_empty_batches(
     items: Iterable[dict[str, Any]],
     batch_size: int,
-) -> Iterable[tuple[list[dict[str, Any]], int, int]]:
+    *,
+    sample: float = 1.0,
+    rng: random.Random | None = None,
+) -> Iterable[tuple[list[dict[str, Any]], int, int, int]]:
     batch: list[dict[str, Any]] = []
     read_count = 0
     skipped_empty_since_batch = 0
+    skipped_sampled_since_batch = 0
     for item in items:
         read_count += 1
         if not item["text"].strip():
             skipped_empty_since_batch += 1
             continue
+        if sample < 1.0 and (rng or random).random() >= sample:
+            skipped_sampled_since_batch += 1
+            continue
         batch.append(item)
         if len(batch) >= batch_size:
-            yield batch, read_count, skipped_empty_since_batch
+            yield batch, read_count, skipped_empty_since_batch, skipped_sampled_since_batch
             skipped_empty_since_batch = 0
+            skipped_sampled_since_batch = 0
             batch = []
     if batch:
-        yield batch, read_count, skipped_empty_since_batch
-    elif skipped_empty_since_batch:
-        yield [], read_count, skipped_empty_since_batch
+        yield batch, read_count, skipped_empty_since_batch, skipped_sampled_since_batch
+    elif skipped_empty_since_batch or skipped_sampled_since_batch:
+        yield [], read_count, skipped_empty_since_batch, skipped_sampled_since_batch
+
+
+def publication_year(value: Any) -> int | None:
+    if value is None:
+        return None
+    match = re.search(r"(?<!\d)(1[5-9]\d{2}|20\d{2})(?!\d)", str(value))
+    return int(match.group(1)) if match else None
+
+
+def input_path_year(path: str) -> int | None:
+    name = Path(path).name
+    matches = re.findall(r"(?<!\d)(1[5-9]\d{2}|20\d{2})(?!\d)", name)
+    return int(matches[-1]) if matches else None
+
+
+def first_input_publication_year(path: str) -> int | None:
+    for row in iter_input_rows(path):
+        year = publication_year(row["publication_date"])
+        if year is not None:
+            return year
+    return None
 
 
 def text_preview(text: str, *, max_chars: int = 80) -> str:
@@ -240,6 +292,11 @@ def validate_inference_stats(stats: dict[str, Any], pipeline: Any) -> None:
         )
 
 
+def write_empty_output(path: str) -> None:
+    with open_text(path, "wt"):
+        pass
+
+
 def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
     with open_text(path, "rt") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -274,6 +331,8 @@ class MediaSourcesProcessor:
         dtype: str,
         batch_size: int,
         outer_batch_size: int,
+        sample: float,
+        sample_seed: int | None,
         device: str | int | None,
         min_score: float | None,
         filter_anachronistic: bool,
@@ -287,6 +346,8 @@ class MediaSourcesProcessor:
             raise ValueError("batch_size must be positive")
         if outer_batch_size <= 0:
             raise ValueError("outer_batch_size must be positive")
+        if not 0.0 < sample <= 1.0:
+            raise ValueError("sample must be greater than 0 and less than or equal to 1")
         if dtype == "float16" and str(device).lower() in {"-1", "cpu"}:
             raise ValueError("float16 dtype is not supported for CPU inference; use float32 or a CUDA device")
 
@@ -297,6 +358,8 @@ class MediaSourcesProcessor:
         self.requested_dtype = dtype
         self.batch_size = batch_size
         self.outer_batch_size = outer_batch_size
+        self.sample = sample
+        self.sample_seed = sample_seed
         self.min_score = min_score
         self.filter_anachronistic = filter_anachronistic
         self.diagnostics = diagnostics
@@ -306,6 +369,7 @@ class MediaSourcesProcessor:
         setup_logging(log_level, log_file, logger=log)
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s dtype=%s", hf_model, revision, dtype)
         log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
+        log.info("Configured sampling: sample=%s sample_seed=%s", sample, sample_seed)
         log.info(
             "Threading environment: TOKENIZERS_PARALLELISM=%r RAYON_NUM_THREADS=%r "
             "OMP_NUM_THREADS=%r MKL_NUM_THREADS=%r",
@@ -352,12 +416,14 @@ class MediaSourcesProcessor:
         )
         self.model_id = f"{hf_model}@{revision}#{dtype}"
         log.debug(
-            "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s min_score=%s "
-            "device=%s filter_anachronistic=%s diagnostics=%s write_empty=%s local_files_only=%s",
+            "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s sample=%s sample_seed=%s "
+            "min_score=%s device=%s filter_anachronistic=%s diagnostics=%s write_empty=%s local_files_only=%s",
             input_file,
             output_file,
             batch_size,
             outer_batch_size,
+            sample,
+            sample_seed,
             min_score,
             device,
             filter_anachronistic,
@@ -394,15 +460,23 @@ class MediaSourcesProcessor:
         postprocess_seconds = 0.0
         written_count = 0
         skipped_empty_count = 0
+        skipped_sampled_count = 0
         entity_counts: dict[str, int] = {}
+        rng = random.Random(self.sample_seed) if self.sample_seed is not None else None
 
         with open_text(self.output_file, "wt") as output_stream:
-            for outer_batch_index, (batch, latest_read_count, skipped_empty_since_batch) in enumerate(
-                non_empty_batches(iter_input_rows(self.input_file), self.outer_batch_size),
+            for outer_batch_index, (
+                batch,
+                latest_read_count,
+                skipped_empty_since_batch,
+                skipped_sampled_since_batch,
+            ) in enumerate(
+                non_empty_batches(iter_input_rows(self.input_file), self.outer_batch_size, sample=self.sample, rng=rng),
                 start=1,
             ):
                 read_count = latest_read_count
                 skipped_empty_count += skipped_empty_since_batch
+                skipped_sampled_count += skipped_sampled_since_batch
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug(
                         "Outer batch %s non-empty rows: %s",
@@ -420,10 +494,12 @@ class MediaSourcesProcessor:
                     )
                 if not batch:
                     log.info(
-                        "Outer batch %s: docs=0 read_rows=%s skipped_empty_docs_since_previous=%s",
+                        "Outer batch %s: docs=0 read_rows=%s skipped_empty_docs_since_previous=%s "
+                        "skipped_sampled_docs_since_previous=%s",
                         outer_batch_index,
                         read_count,
                         skipped_empty_since_batch,
+                        skipped_sampled_since_batch,
                     )
                     continue
 
@@ -433,15 +509,18 @@ class MediaSourcesProcessor:
                 batch_chars = sum(item["length"] for item in sorted_items)
                 doc_lengths = [item["length"] for item in sorted_items]
                 log.info(
-                    "Outer batch %s: docs=%s read_rows=%s skipped_empty_docs_since_previous=%s chars=%s "
-                    "model_window_batch_size=%s outer_batch_size=%s doc_lengths=%s",
+                    "Outer batch %s: docs=%s read_rows=%s skipped_empty_docs_since_previous=%s "
+                    "skipped_sampled_docs_since_previous=%s chars=%s model_window_batch_size=%s "
+                    "outer_batch_size=%s sample=%s doc_lengths=%s",
                     outer_batch_index,
                     len(sorted_items),
                     read_count,
                     skipped_empty_since_batch,
+                    skipped_sampled_since_batch,
                     fmt_int(batch_chars),
                     self.batch_size,
                     self.outer_batch_size,
+                    self.sample,
                     length_summary(doc_lengths),
                 )
                 if log.isEnabledFor(logging.DEBUG):
@@ -613,6 +692,7 @@ class MediaSourcesProcessor:
         log.info("Read rows: %s", read_count)
         log.info("Processed non-empty docs: %s", processed_count)
         log.info("Skipped empty docs: %s", skipped_empty_count)
+        log.info("Skipped sampled-out non-empty docs: %s", skipped_sampled_count)
         log.info("Written rows: %s", written_count)
         log.info("Recognized media-source entities: %s", sum(entity_counts.values()))
         log.info("Inference configuration:")
@@ -624,6 +704,8 @@ class MediaSourcesProcessor:
         log.info("  device: %s", getattr(self.pipeline, "device", "unknown"))
         log.info("  model_window_batch_size: %s", self.batch_size)
         log.info("  outer_batch_size: %s", self.outer_batch_size)
+        log.info("  sample: %s", self.sample)
+        log.info("  sample_seed: %s", self.sample_seed)
         log.info("Workload:")
         log.info("  Characters: %s", fmt_int(processed_chars))
         log.info("  Tokens: %s", fmt_int(processed_tokens))
@@ -670,6 +752,38 @@ def main(args: list[str] | None = None) -> None:
     # even if pipeline construction fails.
     setup_logging(options.log_level, options.log_file, logger=log)
     log.info("%s", options)
+    if not 0.0 < options.sample <= 1.0:
+        raise ValueError("--sample must be greater than 0 and less than or equal to 1")
+
+    if options.min_year is not None:
+        input_year = input_path_year(options.input)
+        year_source = "input path"
+        if input_year is None:
+            input_year = first_input_publication_year(options.input)
+            year_source = "first input row"
+        if input_year is None:
+            log.warning(
+                "Could not determine input publication year for --min-year=%s; processing normally",
+                options.min_year,
+            )
+        elif input_year < options.min_year:
+            log.info(
+                "Skipping media-source processing for input_year=%s from %s because it is earlier than "
+                "--min-year=%s; writing empty output %s",
+                input_year,
+                year_source,
+                options.min_year,
+                options.output,
+            )
+            write_empty_output(options.output)
+            return
+        else:
+            log.info(
+                "Input year check passed: input_year=%s from %s >= min_year=%s",
+                input_year,
+                year_source,
+                options.min_year,
+            )
 
     device = None if str(options.device).lower() == "auto" else options.device
     if isinstance(device, str) and device.lstrip("-").isdigit():
@@ -682,6 +796,8 @@ def main(args: list[str] | None = None) -> None:
         dtype=options.dtype,
         batch_size=options.batch_size,
         outer_batch_size=options.outer_batch_size,
+        sample=options.sample,
+        sample_seed=options.sample_seed,
         device=device,
         min_score=options.min_score,
         local_files_only=options.local_files_only,
