@@ -169,10 +169,31 @@ def length_summary(lengths: list[int]) -> str:
     if not lengths:
         return "[]"
     sorted_lengths = sorted(lengths)
+    count = len(sorted_lengths)
+
+    def percentile(percent: float) -> int:
+        if count == 1:
+            return sorted_lengths[0]
+        position = (count - 1) * percent
+        lower = int(position)
+        upper = min(lower + 1, count - 1)
+        fraction = position - lower
+        return int(round(sorted_lengths[lower] * (1.0 - fraction) + sorted_lengths[upper] * fraction))
+
+    mean = sum(sorted_lengths) / count
     return (
-        f"count={len(sorted_lengths)} min={sorted_lengths[0]} "
-        f"max={sorted_lengths[-1]} lengths={sorted_lengths}"
+        f"count={count} min={sorted_lengths[0]} p25={percentile(0.25)} "
+        f"median={percentile(0.50)} p75={percentile(0.75)} "
+        f"p95={percentile(0.95)} max={sorted_lengths[-1]} mean={mean:.1f}"
     )
+
+
+def fmt_int(value: int | float) -> str:
+    return f"{value:,.0f}"
+
+
+def fmt_seconds(value: float) -> str:
+    return f"{value:.2f}s"
 
 
 def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
@@ -227,6 +248,9 @@ class MediaSourcesProcessor:
 
         self.input_file = input_file
         self.output_file = output_file
+        self.hf_model = hf_model
+        self.revision = revision
+        self.requested_dtype = dtype
         self.batch_size = batch_size
         self.outer_batch_size = outer_batch_size
         self.min_score = min_score
@@ -265,9 +289,10 @@ class MediaSourcesProcessor:
             local_files_only=local_files_only,
         )
         model_config = getattr(getattr(self.pipeline, "model", None), "config", None)
-        commit_hash = getattr(model_config, "_commit_hash", "unknown")
-        log.info("Model commit hash: %s", commit_hash)
-        log.info("Model dtype: %s", model_dtype(getattr(self.pipeline, "model", None)))
+        self.model_commit_hash = getattr(model_config, "_commit_hash", "unknown")
+        self.observed_dtype = model_dtype(getattr(self.pipeline, "model", None))
+        log.info("Model commit hash: %s", self.model_commit_hash)
+        log.info("Model dtype: %s", self.observed_dtype)
         self.model_id = f"{hf_model}@{revision}#{dtype}"
         log.debug(
             "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s min_score=%s "
@@ -293,9 +318,16 @@ class MediaSourcesProcessor:
         )
 
     def run(self) -> None:
-        started = time.time()
+        started = time.perf_counter()
         read_count = 0
         processed_count = 0
+        processed_chars = 0
+        processed_tokens = 0
+        processed_windows = 0
+        model_batches = 0
+        pipeline_seconds = 0.0
+        inference_seconds = 0.0
+        model_forward_seconds = 0.0
         written_count = 0
         skipped_empty_count = 0
         entity_counts: dict[str, int] = {}
@@ -325,7 +357,7 @@ class MediaSourcesProcessor:
                 skipped_empty_count += len(batch) - len(non_empty)
                 if not non_empty:
                     log.info(
-                        "Outer batch %s: raw_docs=%s non_empty_docs=0 skipped_empty_docs=%s doc_lengths=%s",
+                        "Outer batch %s: docs=0/%s skipped_empty_docs=%s doc_lengths=%s",
                         outer_batch_index,
                         len(batch),
                         len(batch),
@@ -336,18 +368,22 @@ class MediaSourcesProcessor:
                 # Reorder only inside the outer batch. Results are joined back by
                 # stable item IDs, so corpus-level output identity is unaffected.
                 sorted_items = sorted(non_empty, key=lambda item: item["length"])
+                batch_chars = sum(item["length"] for item in sorted_items)
+                doc_lengths = [item["length"] for item in sorted_items]
                 log.info(
-                    "Outer batch %s: raw_docs=%s non_empty_docs=%s skipped_empty_docs=%s "
+                    "Outer batch %s: docs=%s/%s skipped_empty_docs=%s chars=%s "
                     "model_window_batch_size=%s outer_batch_size=%s doc_lengths=%s",
                     outer_batch_index,
-                    len(batch),
                     len(sorted_items),
+                    len(batch),
                     len(batch) - len(non_empty),
+                    fmt_int(batch_chars),
                     self.batch_size,
                     self.outer_batch_size,
-                    length_summary([item["length"] for item in sorted_items]),
+                    length_summary(doc_lengths),
                 )
                 if log.isEnabledFor(logging.DEBUG):
+                    log.debug("Outer batch %s sorted doc lengths: %s", outer_batch_index, sorted(doc_lengths))
                     log.debug(
                         "Outer batch %s sorted order: %s",
                         outer_batch_index,
@@ -364,7 +400,7 @@ class MediaSourcesProcessor:
                 texts = [item["text"] for item in sorted_items]
                 publication_dates = [item["publication_date"] for item in sorted_items]
 
-                batch_started = time.time()
+                batch_started = time.perf_counter()
                 results = self.pipeline(
                     texts,
                     publication_date=publication_dates,
@@ -373,16 +409,57 @@ class MediaSourcesProcessor:
                 )
                 if not isinstance(results, list):
                     results = [results]
-                duration = max(time.time() - batch_started, 1e-9)
+                duration = max(time.perf_counter() - batch_started, 1e-9)
+                stats = getattr(self.pipeline, "last_inference_stats", {}) or {}
+                batch_tokens = int(stats.get("tokens") or 0)
+                batch_windows = int(stats.get("windows") or 0)
+                batch_model_batches = int(stats.get("model_batches") or 0)
+                batch_pipeline_seconds = float(stats.get("pipeline_seconds") or duration)
+                batch_inference_seconds = float(stats.get("inference_seconds") or 0.0)
+                batch_model_forward_seconds = float(stats.get("model_forward_seconds") or 0.0)
                 processed_count += len(sorted_items)
+                processed_chars += batch_chars
+                processed_tokens += batch_tokens
+                processed_windows += batch_windows
+                model_batches += batch_model_batches
+                pipeline_seconds += batch_pipeline_seconds
+                inference_seconds += batch_inference_seconds
+                model_forward_seconds += batch_model_forward_seconds
 
                 log.info(
-                    "Processed outer batch %s: %s docs in %.2fs (%.1f docs/s)",
+                    "Processed outer batch %s: duration=%s docs=%s docs/s=%.1f chars=%s kchars/s=%.1f "
+                    "tokens=%s windows=%s windows/s=%.1f model_batches=%s inference=%s model_forward=%s",
                     outer_batch_index,
+                    fmt_seconds(duration),
                     len(sorted_items),
-                    duration,
                     len(sorted_items) / duration,
+                    fmt_int(batch_chars),
+                    (batch_chars / 1000.0) / duration,
+                    fmt_int(batch_tokens),
+                    fmt_int(batch_windows),
+                    batch_windows / duration if batch_windows else 0.0,
+                    batch_model_batches,
+                    fmt_seconds(batch_inference_seconds),
+                    fmt_seconds(batch_model_forward_seconds),
                 )
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug("Outer batch %s inference stats: %s", outer_batch_index, stats)
+                    log.debug(
+                        "Outer batch %s window detail: primary_windows=%s rescue_windows=%s model_batch_sizes=%s",
+                        outer_batch_index,
+                        int(stats.get("primary_windows") or 0),
+                        max(0, batch_windows - int(stats.get("primary_windows") or 0)),
+                        stats.get("model_batch_sizes"),
+                    )
+                    log.debug(
+                        "Outer batch %s timing detail: tokenize=%s inference=%s model_forward=%s decode=%s pipeline=%s",
+                        outer_batch_index,
+                        fmt_seconds(float(stats.get("tokenize_seconds") or 0.0)),
+                        fmt_seconds(batch_inference_seconds),
+                        fmt_seconds(batch_model_forward_seconds),
+                        fmt_seconds(float(stats.get("decode_seconds") or 0.0)),
+                        fmt_seconds(batch_pipeline_seconds),
+                    )
 
                 for item, result in zip(sorted_items, results, strict=True):
                     entities = result.get("entities", [])
@@ -447,14 +524,45 @@ class MediaSourcesProcessor:
                     output_stream.write(json.dumps(output_row, ensure_ascii=False) + "\n")
                     written_count += 1
 
-        total_duration = max(time.time() - started, 1e-9)
+        total_duration = max(time.perf_counter() - started, 1e-9)
         log.info("Completed media-source processing")
         log.info("Read rows: %s", read_count)
         log.info("Processed non-empty docs: %s", processed_count)
         log.info("Skipped empty docs: %s", skipped_empty_count)
         log.info("Written rows: %s", written_count)
         log.info("Recognized media-source entities: %s", sum(entity_counts.values()))
-        log.info("Throughput: %.1f docs/s", processed_count / total_duration)
+        log.info("Inference configuration:")
+        log.info("  model: %s", self.hf_model)
+        log.info("  revision: %s", self.revision)
+        log.info("  commit: %s", self.model_commit_hash)
+        log.info("  requested_dtype: %s", self.requested_dtype)
+        log.info("  observed_dtype: %s", self.observed_dtype)
+        log.info("  device: %s", getattr(self.pipeline, "device", "unknown"))
+        log.info("  model_window_batch_size: %s", self.batch_size)
+        log.info("  outer_batch_size: %s", self.outer_batch_size)
+        log.info("Workload:")
+        log.info("  Characters: %s", fmt_int(processed_chars))
+        log.info("  Tokens: %s", fmt_int(processed_tokens))
+        log.info("  Model windows: %s", fmt_int(processed_windows))
+        log.info("  Model batches: %s", fmt_int(model_batches))
+        if model_batches:
+            log.info("  Mean windows per batch: %.1f", processed_windows / model_batches)
+            log.info("  Batch fill: %.1f%%", 100.0 * processed_windows / (model_batches * self.batch_size))
+        log.info("Timing:")
+        log.info("  Total: %.1fs", total_duration)
+        log.info("  Pipeline: %.1fs", pipeline_seconds)
+        log.info("  Inference/windowing: %.1fs", inference_seconds)
+        log.info("  Model forward: %.1fs", model_forward_seconds)
+        log.info("Throughput:")
+        log.info("  %.1f docs/s", processed_count / total_duration)
+        if processed_chars:
+            log.info("  %.1f kchars/s", (processed_chars / 1000.0) / total_duration)
+        if processed_windows:
+            log.info("  %.1f windows/s end-to-end", processed_windows / total_duration)
+        if processed_windows and inference_seconds:
+            log.info("  %.1f windows/s inference", processed_windows / inference_seconds)
+        if processed_windows and model_forward_seconds:
+            log.info("  %.1f windows/s model-forward", processed_windows / model_forward_seconds)
         if entity_counts:
             log.info("Entity type summary:")
             for label, count in sorted(entity_counts.items(), key=lambda item: item[1], reverse=True):
