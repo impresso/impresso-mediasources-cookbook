@@ -25,6 +25,8 @@ REQUIRED_INFERENCE_STATS = {
     "logits_to_cpu_seconds",
     "reconstruction_seconds",
     "decode_seconds",
+    "viterbi_seconds",
+    "postprocess_seconds",
     "pipeline_seconds",
 }
 
@@ -388,6 +390,8 @@ class MediaSourcesProcessor:
         logits_to_cpu_seconds = 0.0
         reconstruction_seconds = 0.0
         decode_seconds = 0.0
+        viterbi_seconds = 0.0
+        postprocess_seconds = 0.0
         written_count = 0
         skipped_empty_count = 0
         entity_counts: dict[str, int] = {}
@@ -481,6 +485,8 @@ class MediaSourcesProcessor:
                 batch_logits_to_cpu_seconds = float(stats.get("logits_to_cpu_seconds") or 0.0)
                 batch_reconstruction_seconds = float(stats.get("reconstruction_seconds") or 0.0)
                 batch_decode_seconds = float(stats.get("decode_seconds") or 0.0)
+                batch_viterbi_seconds = float(stats.get("viterbi_seconds") or 0.0)
+                batch_postprocess_seconds = float(stats.get("postprocess_seconds") or 0.0)
                 processed_count += len(sorted_items)
                 processed_chars += batch_chars
                 processed_tokens += batch_tokens
@@ -494,6 +500,8 @@ class MediaSourcesProcessor:
                 logits_to_cpu_seconds += batch_logits_to_cpu_seconds
                 reconstruction_seconds += batch_reconstruction_seconds
                 decode_seconds += batch_decode_seconds
+                viterbi_seconds += batch_viterbi_seconds
+                postprocess_seconds += batch_postprocess_seconds
 
                 log.info(
                     "Processed outer batch %s: duration=%s docs=%s docs/s=%.1f chars=%s kchars/s=%.1f "
@@ -522,7 +530,8 @@ class MediaSourcesProcessor:
                     )
                     log.debug(
                         "Outer batch %s timing detail: tokenize=%s inference=%s window_tokenize=%s "
-                        "model_dispatch=%s logits_to_cpu=%s reconstruction=%s decode=%s pipeline=%s",
+                        "model_dispatch=%s logits_to_cpu=%s reconstruction=%s decode=%s "
+                        "viterbi=%s postprocess=%s pipeline=%s",
                         outer_batch_index,
                         fmt_seconds(batch_tokenize_seconds),
                         fmt_seconds(batch_inference_seconds),
@@ -531,6 +540,8 @@ class MediaSourcesProcessor:
                         fmt_seconds(batch_logits_to_cpu_seconds),
                         fmt_seconds(batch_reconstruction_seconds),
                         fmt_seconds(batch_decode_seconds),
+                        fmt_seconds(batch_viterbi_seconds),
+                        fmt_seconds(batch_postprocess_seconds),
                         fmt_seconds(batch_pipeline_seconds),
                     )
 
@@ -633,6 +644,8 @@ class MediaSourcesProcessor:
         log.info("      Logits -> CPU: %s", fmt_seconds_percent(logits_to_cpu_seconds, pipeline_seconds))
         log.info("      Reconstruction: %s", fmt_seconds_percent(reconstruction_seconds, pipeline_seconds))
         log.info("    Decode: %s", fmt_seconds_percent(decode_seconds, pipeline_seconds))
+        log.info("      Viterbi: %s", fmt_seconds_percent(viterbi_seconds, pipeline_seconds))
+        log.info("      Post-processing: %s", fmt_seconds_percent(postprocess_seconds, pipeline_seconds))
         log.info("    Unaccounted: %s", fmt_seconds_percent(unaccounted_pipeline_seconds, pipeline_seconds))
         log.info("Throughput:")
         log.info("  %.1f docs/s", processed_count / total_duration)
