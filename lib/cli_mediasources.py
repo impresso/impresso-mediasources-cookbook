@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,8 +19,13 @@ REQUIRED_INFERENCE_STATS = {
     "tokens",
     "windows",
     "model_batches",
+    "window_tokenize_seconds",
     "inference_seconds",
-    "model_forward_seconds",
+    "model_dispatch_seconds",
+    "logits_to_cpu_seconds",
+    "reconstruction_seconds",
+    "decode_seconds",
+    "pipeline_seconds",
 }
 
 from smart_open import open as smart_open  # type: ignore
@@ -216,6 +222,11 @@ def fmt_seconds(value: float) -> str:
     return f"{value:.2f}s"
 
 
+def fmt_seconds_percent(value: float, total: float) -> str:
+    percent = (100.0 * value / total) if total else 0.0
+    return f"{value:.1f}s ({percent:.1f}% pipeline)"
+
+
 def validate_inference_stats(stats: dict[str, Any], pipeline: Any) -> None:
     missing_stats = REQUIRED_INFERENCE_STATS - stats.keys()
     if missing_stats:
@@ -293,6 +304,14 @@ class MediaSourcesProcessor:
         setup_logging(log_level, log_file, logger=log)
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s dtype=%s", hf_model, revision, dtype)
         log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
+        log.info(
+            "Threading environment: TOKENIZERS_PARALLELISM=%r RAYON_NUM_THREADS=%r "
+            "OMP_NUM_THREADS=%r MKL_NUM_THREADS=%r",
+            os.environ.get("TOKENIZERS_PARALLELISM"),
+            os.environ.get("RAYON_NUM_THREADS"),
+            os.environ.get("OMP_NUM_THREADS"),
+            os.environ.get("MKL_NUM_THREADS"),
+        )
         try:
             import impresso_pipelines  # type: ignore
             import torch  # type: ignore
@@ -324,6 +343,11 @@ class MediaSourcesProcessor:
         self.observed_dtype = model_dtype(getattr(self.pipeline, "model", None))
         log.info("Model commit hash: %s", self.model_commit_hash)
         log.info("Model dtype: %s", self.observed_dtype)
+        log.info(
+            "Tokenizer runtime: class=%s is_fast=%s",
+            type(getattr(self.pipeline, "tokenizer", None)).__name__,
+            getattr(getattr(self.pipeline, "tokenizer", None), "is_fast", None),
+        )
         self.model_id = f"{hf_model}@{revision}#{dtype}"
         log.debug(
             "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s min_score=%s "
@@ -357,8 +381,13 @@ class MediaSourcesProcessor:
         processed_windows = 0
         model_batches = 0
         pipeline_seconds = 0.0
+        tokenize_seconds = 0.0
         inference_seconds = 0.0
-        model_forward_seconds = 0.0
+        window_tokenize_seconds = 0.0
+        model_dispatch_seconds = 0.0
+        logits_to_cpu_seconds = 0.0
+        reconstruction_seconds = 0.0
+        decode_seconds = 0.0
         written_count = 0
         skipped_empty_count = 0
         entity_counts: dict[str, int] = {}
@@ -445,20 +474,30 @@ class MediaSourcesProcessor:
                 batch_windows = int(stats.get("windows") or 0)
                 batch_model_batches = int(stats.get("model_batches") or 0)
                 batch_pipeline_seconds = float(stats.get("pipeline_seconds") or duration)
+                batch_tokenize_seconds = float(stats.get("tokenize_seconds") or 0.0)
                 batch_inference_seconds = float(stats.get("inference_seconds") or 0.0)
-                batch_model_forward_seconds = float(stats.get("model_forward_seconds") or 0.0)
+                batch_window_tokenize_seconds = float(stats.get("window_tokenize_seconds") or 0.0)
+                batch_model_dispatch_seconds = float(stats.get("model_dispatch_seconds") or 0.0)
+                batch_logits_to_cpu_seconds = float(stats.get("logits_to_cpu_seconds") or 0.0)
+                batch_reconstruction_seconds = float(stats.get("reconstruction_seconds") or 0.0)
+                batch_decode_seconds = float(stats.get("decode_seconds") or 0.0)
                 processed_count += len(sorted_items)
                 processed_chars += batch_chars
                 processed_tokens += batch_tokens
                 processed_windows += batch_windows
                 model_batches += batch_model_batches
                 pipeline_seconds += batch_pipeline_seconds
+                tokenize_seconds += batch_tokenize_seconds
                 inference_seconds += batch_inference_seconds
-                model_forward_seconds += batch_model_forward_seconds
+                window_tokenize_seconds += batch_window_tokenize_seconds
+                model_dispatch_seconds += batch_model_dispatch_seconds
+                logits_to_cpu_seconds += batch_logits_to_cpu_seconds
+                reconstruction_seconds += batch_reconstruction_seconds
+                decode_seconds += batch_decode_seconds
 
                 log.info(
                     "Processed outer batch %s: duration=%s docs=%s docs/s=%.1f chars=%s kchars/s=%.1f "
-                    "tokens=%s windows=%s windows/s=%.1f model_batches=%s inference=%s model_forward=%s",
+                    "tokens=%s windows=%s windows/s=%.1f model_batches=%s inference=%s model_dispatch=%s",
                     outer_batch_index,
                     fmt_seconds(duration),
                     len(sorted_items),
@@ -470,7 +509,7 @@ class MediaSourcesProcessor:
                     batch_windows / duration if batch_windows else 0.0,
                     batch_model_batches,
                     fmt_seconds(batch_inference_seconds),
-                    fmt_seconds(batch_model_forward_seconds),
+                    fmt_seconds(batch_model_dispatch_seconds),
                 )
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug("Outer batch %s inference stats: %s", outer_batch_index, stats)
@@ -482,12 +521,16 @@ class MediaSourcesProcessor:
                         stats.get("model_batch_sizes"),
                     )
                     log.debug(
-                        "Outer batch %s timing detail: tokenize=%s inference=%s model_forward=%s decode=%s pipeline=%s",
+                        "Outer batch %s timing detail: tokenize=%s inference=%s window_tokenize=%s "
+                        "model_dispatch=%s logits_to_cpu=%s reconstruction=%s decode=%s pipeline=%s",
                         outer_batch_index,
-                        fmt_seconds(float(stats.get("tokenize_seconds") or 0.0)),
+                        fmt_seconds(batch_tokenize_seconds),
                         fmt_seconds(batch_inference_seconds),
-                        fmt_seconds(batch_model_forward_seconds),
-                        fmt_seconds(float(stats.get("decode_seconds") or 0.0)),
+                        fmt_seconds(batch_window_tokenize_seconds),
+                        fmt_seconds(batch_model_dispatch_seconds),
+                        fmt_seconds(batch_logits_to_cpu_seconds),
+                        fmt_seconds(batch_reconstruction_seconds),
+                        fmt_seconds(batch_decode_seconds),
                         fmt_seconds(batch_pipeline_seconds),
                     )
 
@@ -578,11 +621,19 @@ class MediaSourcesProcessor:
         if model_batches:
             log.info("  Mean windows per batch: %.1f", processed_windows / model_batches)
             log.info("  Batch fill: %.1f%%", 100.0 * processed_windows / (model_batches * self.batch_size))
+        accounted_pipeline_seconds = tokenize_seconds + inference_seconds + decode_seconds
+        unaccounted_pipeline_seconds = max(0.0, pipeline_seconds - accounted_pipeline_seconds)
         log.info("Timing:")
         log.info("  Total: %.1fs", total_duration)
         log.info("  Pipeline: %.1fs", pipeline_seconds)
-        log.info("  Inference/windowing: %.1fs", inference_seconds)
-        log.info("  Model forward: %.1fs", model_forward_seconds)
+        log.info("    Annotation tokenizing: %s", fmt_seconds_percent(tokenize_seconds, pipeline_seconds))
+        log.info("    Inference/windowing: %s", fmt_seconds_percent(inference_seconds, pipeline_seconds))
+        log.info("      HF window tokenizing: %s", fmt_seconds_percent(window_tokenize_seconds, pipeline_seconds))
+        log.info("      Model dispatch: %s (async)", fmt_seconds_percent(model_dispatch_seconds, pipeline_seconds))
+        log.info("      Logits -> CPU: %s", fmt_seconds_percent(logits_to_cpu_seconds, pipeline_seconds))
+        log.info("      Reconstruction: %s", fmt_seconds_percent(reconstruction_seconds, pipeline_seconds))
+        log.info("    Decode: %s", fmt_seconds_percent(decode_seconds, pipeline_seconds))
+        log.info("    Unaccounted: %s", fmt_seconds_percent(unaccounted_pipeline_seconds, pipeline_seconds))
         log.info("Throughput:")
         log.info("  %.1f docs/s", processed_count / total_duration)
         if processed_chars:
@@ -591,8 +642,8 @@ class MediaSourcesProcessor:
             log.info("  %.1f windows/s end-to-end", processed_windows / total_duration)
         if processed_windows and inference_seconds:
             log.info("  %.1f windows/s inference", processed_windows / inference_seconds)
-        if processed_windows and model_forward_seconds:
-            log.info("  %.1f windows/s model-forward", processed_windows / model_forward_seconds)
+        if processed_windows and model_dispatch_seconds:
+            log.info("  %.1f windows/s model-dispatch async", processed_windows / model_dispatch_seconds)
         if entity_counts:
             log.info("Entity type summary:")
             for label, count in sorted(entity_counts.items(), key=lambda item: item[1], reverse=True):
