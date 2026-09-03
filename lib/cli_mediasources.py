@@ -86,8 +86,8 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sample",
         type=float,
-        default=1.0,
-        help="Randomly keep this fraction of non-empty documents before inference (0 < sample <= 1; default: %(default)s)",
+        default=None,
+        help="Randomly keep this fraction of non-empty documents before inference (0 < sample <= 1; default: 1.0)",
     )
     parser.add_argument(
         "--sample-seed",
@@ -295,6 +295,20 @@ def validate_inference_stats(stats: dict[str, Any], pipeline: Any) -> None:
 def write_empty_output(path: str) -> None:
     with open_text(path, "wt"):
         pass
+
+
+def env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
+def env_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return float(value)
 
 
 def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
@@ -768,6 +782,13 @@ class MediaSourcesProcessor:
 
 def main(args: list[str] | None = None) -> None:
     options = parse_args(args)
+    if options.min_year is None:
+        options.min_year = env_int("MIN_YEAR_MEDIASOURCES")
+    if options.sample is None:
+        env_sample = env_float("SAMPLE_MEDIASOURCES")
+        options.sample = 1.0 if env_sample is None else env_sample
+    if options.sample_seed is None:
+        options.sample_seed = env_int("SAMPLE_SEED_MEDIASOURCES")
 
     # Configure logging before model initialization so CLI arguments are captured
     # even if pipeline construction fails.
