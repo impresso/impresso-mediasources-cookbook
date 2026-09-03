@@ -142,6 +142,33 @@ def entity_to_nel(entity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def model_dtype(model: Any) -> str:
+    dtype = getattr(model, "dtype", None)
+    if dtype is not None:
+        return str(dtype)
+
+    parameters = getattr(model, "parameters", None)
+    if callable(parameters):
+        try:
+            return str(next(parameters()).dtype)
+        except StopIteration:
+            return "no parameters"
+        except Exception as exc:
+            return f"unavailable ({exc})"
+
+    return "unavailable"
+
+
+def length_summary(lengths: list[int]) -> str:
+    if not lengths:
+        return "[]"
+    sorted_lengths = sorted(lengths)
+    return (
+        f"count={len(sorted_lengths)} min={sorted_lengths[0]} "
+        f"max={sorted_lengths[-1]} lengths={sorted_lengths}"
+    )
+
+
 def iter_input_rows(path: str) -> Iterable[dict[str, Any]]:
     with open_text(path, "rt") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -201,6 +228,7 @@ class MediaSourcesProcessor:
 
         setup_logging(log_level, log_file, logger=log)
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s", hf_model, revision)
+        log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
         if log.isEnabledFor(logging.DEBUG):
             try:
                 import impresso_pipelines  # type: ignore
@@ -229,6 +257,7 @@ class MediaSourcesProcessor:
         model_config = getattr(getattr(self.pipeline, "model", None), "config", None)
         commit_hash = getattr(model_config, "_commit_hash", "unknown")
         log.info("Model commit hash: %s", commit_hash)
+        log.info("Model dtype: %s", model_dtype(getattr(self.pipeline, "model", None)))
         self.model_id = f"{hf_model}@{revision}"
         log.debug(
             "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s min_score=%s "
@@ -285,12 +314,29 @@ class MediaSourcesProcessor:
                 non_empty = [item for item in batch if item["text"].strip()]
                 skipped_empty_count += len(batch) - len(non_empty)
                 if not non_empty:
-                    log.debug("Outer batch %s contains no non-empty documents", outer_batch_index)
+                    log.info(
+                        "Outer batch %s: raw_docs=%s non_empty_docs=0 skipped_empty_docs=%s doc_lengths=%s",
+                        outer_batch_index,
+                        len(batch),
+                        len(batch),
+                        length_summary([item["length"] for item in batch]),
+                    )
                     continue
 
                 # Reorder only inside the outer batch. Results are joined back by
                 # stable item IDs, so corpus-level output identity is unaffected.
                 sorted_items = sorted(non_empty, key=lambda item: item["length"])
+                log.info(
+                    "Outer batch %s: raw_docs=%s non_empty_docs=%s skipped_empty_docs=%s "
+                    "model_window_batch_size=%s outer_batch_size=%s doc_lengths=%s",
+                    outer_batch_index,
+                    len(batch),
+                    len(sorted_items),
+                    len(batch) - len(non_empty),
+                    self.batch_size,
+                    self.outer_batch_size,
+                    length_summary([item["length"] for item in sorted_items]),
+                )
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug(
                         "Outer batch %s sorted order: %s",
