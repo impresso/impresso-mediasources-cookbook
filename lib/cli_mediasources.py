@@ -77,6 +77,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--outer-batch-size", type=int, default=4096, help="Documents buffered before bucketing")
     parser.add_argument(
+        "--outer-batch-max-chars",
+        type=int,
+        default=None,
+        help="Optional maximum total input characters per non-empty outer batch",
+    )
+    parser.add_argument(
         "--min-year",
         "--earliest-year-to-consider",
         dest="min_year",
@@ -123,8 +129,10 @@ def non_empty_batches(
     *,
     sample: float = 1.0,
     rng: random.Random | None = None,
+    max_chars: int | None = None,
 ) -> Iterable[tuple[list[dict[str, Any]], int, int, int]]:
     batch: list[dict[str, Any]] = []
+    batch_chars = 0
     read_count = 0
     skipped_empty_since_batch = 0
     skipped_sampled_since_batch = 0
@@ -136,12 +144,21 @@ def non_empty_batches(
         if sample < 1.0 and (rng or random).random() >= sample:
             skipped_sampled_since_batch += 1
             continue
+        item_length = int(item["length"])
+        if batch and max_chars is not None and batch_chars + item_length > max_chars:
+            yield batch, read_count, skipped_empty_since_batch, skipped_sampled_since_batch
+            skipped_empty_since_batch = 0
+            skipped_sampled_since_batch = 0
+            batch = []
+            batch_chars = 0
         batch.append(item)
+        batch_chars += item_length
         if len(batch) >= batch_size:
             yield batch, read_count, skipped_empty_since_batch, skipped_sampled_since_batch
             skipped_empty_since_batch = 0
             skipped_sampled_since_batch = 0
             batch = []
+            batch_chars = 0
     if batch:
         yield batch, read_count, skipped_empty_since_batch, skipped_sampled_since_batch
     elif skipped_empty_since_batch or skipped_sampled_since_batch:
@@ -367,6 +384,7 @@ class MediaSourcesProcessor:
         dtype: str,
         batch_size: int,
         outer_batch_size: int,
+        outer_batch_max_chars: int | None,
         sample: float,
         sample_seed: int | None,
         device: str | int | None,
@@ -382,6 +400,8 @@ class MediaSourcesProcessor:
             raise ValueError("batch_size must be positive")
         if outer_batch_size <= 0:
             raise ValueError("outer_batch_size must be positive")
+        if outer_batch_max_chars is not None and outer_batch_max_chars <= 0:
+            raise ValueError("outer_batch_max_chars must be positive when set")
         if not 0.0 < sample <= 1.0:
             raise ValueError("sample must be greater than 0 and less than or equal to 1")
         if dtype == "float16" and str(device).lower() in {"-1", "cpu"}:
@@ -394,6 +414,7 @@ class MediaSourcesProcessor:
         self.requested_dtype = dtype
         self.batch_size = batch_size
         self.outer_batch_size = outer_batch_size
+        self.outer_batch_max_chars = outer_batch_max_chars
         self.sample = sample
         self.sample_seed = sample_seed
         self.min_score = min_score
@@ -404,7 +425,12 @@ class MediaSourcesProcessor:
 
         setup_logging(log_level, log_file, logger=log)
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s dtype=%s", hf_model, revision, dtype)
-        log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
+        log.info(
+            "Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s outer_batch_max_chars=%s",
+            batch_size,
+            outer_batch_size,
+            outer_batch_max_chars,
+        )
         log.info("Configured sampling: sample=%s sample_seed=%s", sample, sample_seed)
         log.info("Initial process RSS: %s", fmt_mb(current_rss_mb()))
         log.info(
@@ -453,12 +479,14 @@ class MediaSourcesProcessor:
         )
         self.model_id = f"{hf_model}@{revision}#{dtype}"
         log.debug(
-            "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s sample=%s sample_seed=%s "
-            "min_score=%s device=%s filter_anachronistic=%s diagnostics=%s write_empty=%s local_files_only=%s",
+            "Processor settings: input=%s output=%s batch_size=%s outer_batch_size=%s outer_batch_max_chars=%s "
+            "sample=%s sample_seed=%s min_score=%s device=%s filter_anachronistic=%s diagnostics=%s "
+            "write_empty=%s local_files_only=%s",
             input_file,
             output_file,
             batch_size,
             outer_batch_size,
+            outer_batch_max_chars,
             sample,
             sample_seed,
             min_score,
@@ -508,7 +536,13 @@ class MediaSourcesProcessor:
                 skipped_empty_since_batch,
                 skipped_sampled_since_batch,
             ) in enumerate(
-                non_empty_batches(iter_input_rows(self.input_file), self.outer_batch_size, sample=self.sample, rng=rng),
+                non_empty_batches(
+                    iter_input_rows(self.input_file),
+                    self.outer_batch_size,
+                    sample=self.sample,
+                    rng=rng,
+                    max_chars=self.outer_batch_max_chars,
+                ),
                 start=1,
             ):
                 read_count = latest_read_count
@@ -548,7 +582,7 @@ class MediaSourcesProcessor:
                 log.info(
                     "Outer batch %s: docs=%s read_rows=%s skipped_empty_docs_since_previous=%s "
                     "skipped_sampled_docs_since_previous=%s chars=%s model_window_batch_size=%s "
-                    "outer_batch_size=%s sample=%s doc_lengths=%s",
+                    "outer_batch_size=%s outer_batch_max_chars=%s sample=%s doc_lengths=%s",
                     outer_batch_index,
                     len(sorted_items),
                     read_count,
@@ -557,6 +591,7 @@ class MediaSourcesProcessor:
                     fmt_int(batch_chars),
                     self.batch_size,
                     self.outer_batch_size,
+                    self.outer_batch_max_chars,
                     self.sample,
                     length_summary(doc_lengths),
                 )
@@ -778,6 +813,7 @@ class MediaSourcesProcessor:
         log.info("  device: %s", getattr(self.pipeline, "device", "unknown"))
         log.info("  model_window_batch_size: %s", self.batch_size)
         log.info("  outer_batch_size: %s", self.outer_batch_size)
+        log.info("  outer_batch_max_chars: %s", self.outer_batch_max_chars)
         log.info("  sample: %s", self.sample)
         log.info("  sample_seed: %s", self.sample_seed)
         log.info("Workload:")
@@ -823,6 +859,8 @@ def main(args: list[str] | None = None) -> None:
     options = parse_args(args)
     if options.min_year is None:
         options.min_year = env_int("MIN_YEAR_MEDIASOURCES")
+    if options.outer_batch_max_chars is None:
+        options.outer_batch_max_chars = env_int("OUTER_BATCH_MAX_CHARS_MEDIASOURCES")
     if options.sample is None:
         env_sample = env_float("SAMPLE_MEDIASOURCES")
         options.sample = 1.0 if env_sample is None else env_sample
@@ -834,8 +872,10 @@ def main(args: list[str] | None = None) -> None:
     setup_logging(options.log_level, options.log_file, logger=log)
     log.info("%s", options)
     log.info(
-        "MediaSources environment: MIN_YEAR_MEDIASOURCES=%r SAMPLE_MEDIASOURCES=%r SAMPLE_SEED_MEDIASOURCES=%r",
+        "MediaSources environment: MIN_YEAR_MEDIASOURCES=%r OUTER_BATCH_MAX_CHARS_MEDIASOURCES=%r "
+        "SAMPLE_MEDIASOURCES=%r SAMPLE_SEED_MEDIASOURCES=%r",
         os.environ.get("MIN_YEAR_MEDIASOURCES"),
+        os.environ.get("OUTER_BATCH_MAX_CHARS_MEDIASOURCES"),
         os.environ.get("SAMPLE_MEDIASOURCES"),
         os.environ.get("SAMPLE_SEED_MEDIASOURCES"),
     )
@@ -883,6 +923,7 @@ def main(args: list[str] | None = None) -> None:
         dtype=options.dtype,
         batch_size=options.batch_size,
         outer_batch_size=options.outer_batch_size,
+        outer_batch_max_chars=options.outer_batch_max_chars,
         sample=options.sample,
         sample_seed=options.sample_seed,
         device=device,
