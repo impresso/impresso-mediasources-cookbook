@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from typing import Any
 
 DEBUG_TOKEN_CONTEXT = 2
+DEFAULT_OUTER_BATCH_MAX_CHARS = 3_000_000
 REQUIRED_INFERENCE_STATS = {
     "documents",
     "tokens",
@@ -861,6 +862,8 @@ def main(args: list[str] | None = None) -> None:
         options.min_year = env_int("MIN_YEAR_MEDIASOURCES")
     if options.outer_batch_max_chars is None:
         options.outer_batch_max_chars = env_int("OUTER_BATCH_MAX_CHARS_MEDIASOURCES")
+    if options.outer_batch_max_chars is None:
+        options.outer_batch_max_chars = DEFAULT_OUTER_BATCH_MAX_CHARS
     if options.sample is None:
         env_sample = env_float("SAMPLE_MEDIASOURCES")
         options.sample = 1.0 if env_sample is None else env_sample
