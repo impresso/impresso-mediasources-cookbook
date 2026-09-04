@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import resource
 import sys
 import time
 from pathlib import Path
@@ -281,6 +282,26 @@ def fmt_seconds_percent(value: float, total: float) -> str:
     return f"{value:.1f}s ({percent:.1f}% pipeline)"
 
 
+def current_rss_mb() -> float | None:
+    statm_path = Path("/proc/self/statm")
+    if statm_path.exists():
+        try:
+            resident_pages = int(statm_path.read_text().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+        except Exception:
+            return None
+    try:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return None
+    divisor = 1024.0 if sys.platform != "darwin" else 1024.0 * 1024.0
+    return rss / divisor
+
+
+def fmt_mb(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.1f} MiB"
+
+
 def validate_inference_stats(stats: dict[str, Any], pipeline: Any) -> None:
     missing_stats = REQUIRED_INFERENCE_STATS - stats.keys()
     if missing_stats:
@@ -384,6 +405,7 @@ class MediaSourcesProcessor:
         log.info("Initializing MediaSourcesPipeline model=%s revision=%s dtype=%s", hf_model, revision, dtype)
         log.info("Configured batch sizes: model_window_batch_size=%s outer_batch_size=%s", batch_size, outer_batch_size)
         log.info("Configured sampling: sample=%s sample_seed=%s", sample, sample_seed)
+        log.info("Initial process RSS: %s", fmt_mb(current_rss_mb()))
         log.info(
             "Threading environment: TOKENIZERS_PARALLELISM=%r RAYON_NUM_THREADS=%r "
             "OMP_NUM_THREADS=%r MKL_NUM_THREADS=%r",
@@ -556,6 +578,7 @@ class MediaSourcesProcessor:
                 publication_dates = [item["publication_date"] for item in sorted_items]
 
                 batch_started = time.perf_counter()
+                rss_before_pipeline = current_rss_mb()
                 results = self.pipeline(
                     texts,
                     publication_date=publication_dates,
@@ -565,6 +588,7 @@ class MediaSourcesProcessor:
                 if not isinstance(results, list):
                     results = [results]
                 duration = max(time.perf_counter() - batch_started, 1e-9)
+                rss_after_pipeline = current_rss_mb()
                 stats = getattr(self.pipeline, "last_inference_stats", {}) or {}
                 validate_inference_stats(stats, self.pipeline)
                 batch_tokens = int(stats.get("tokens") or 0)
@@ -611,6 +635,17 @@ class MediaSourcesProcessor:
                     batch_model_batches,
                     fmt_seconds(batch_inference_seconds),
                     fmt_seconds(batch_model_dispatch_seconds),
+                )
+                log.info(
+                    "Outer batch %s memory: rss_before_pipeline=%s rss_after_pipeline=%s delta=%s",
+                    outer_batch_index,
+                    fmt_mb(rss_before_pipeline),
+                    fmt_mb(rss_after_pipeline),
+                    fmt_mb(
+                        None
+                        if rss_before_pipeline is None or rss_after_pipeline is None
+                        else rss_after_pipeline - rss_before_pipeline
+                    ),
                 )
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug("Outer batch %s inference stats: %s", outer_batch_index, stats)
@@ -794,6 +829,12 @@ def main(args: list[str] | None = None) -> None:
     # even if pipeline construction fails.
     setup_logging(options.log_level, options.log_file, logger=log)
     log.info("%s", options)
+    log.info(
+        "MediaSources environment: MIN_YEAR_MEDIASOURCES=%r SAMPLE_MEDIASOURCES=%r SAMPLE_SEED_MEDIASOURCES=%r",
+        os.environ.get("MIN_YEAR_MEDIASOURCES"),
+        os.environ.get("SAMPLE_MEDIASOURCES"),
+        os.environ.get("SAMPLE_SEED_MEDIASOURCES"),
+    )
     if not 0.0 < options.sample <= 1.0:
         raise ValueError("--sample must be greater than 0 and less than or equal to 1")
 
