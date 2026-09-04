@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import inspect
 import json
@@ -735,6 +736,9 @@ class MediaSourcesProcessor:
                         }
                     output_stream.write(json.dumps(output_row, ensure_ascii=False) + "\n")
                     written_count += 1
+                del batch, sorted_items, texts, publication_dates, results
+                gc.collect()
+                log.info("Outer batch %s memory after write cleanup: rss=%s", outer_batch_index, fmt_mb(current_rss_mb()))
 
         total_duration = max(time.perf_counter() - started, 1e-9)
         log.info("Completed media-source processing")
